@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+
+#-----------------------------------------------------------------------------------------//
+# git-clk
+#
+# clk sub command for git to add some easy logging to avoid the aliases.
+#-----------------------------------------------------------------------------------------//
+
+set -euo pipefail
+
+NOTE_GRAPH_REFFLAG=0
+prog="${0##*/}"
+
+die() { echo "error: $*" >&2; exit 2; }
+
+usage() {
+  cat <<'EOF'
+git clk — clk git reports
+
+USAGE
+  git clk <command> [options] [-- <git-log-options>]
+
+COMMANDS
+  log        Pretty one-line log
+  stats      Cumulative change stats
+
+COMPAT ALIASES
+  glog       -> log
+  glog1      -> log --style=tree --all
+  glog2      -> log --style=tree2
+  report1    -> stats --me
+
+GLOBAL OPTIONS (apply to log/stats)
+  --reflog, -g   Use reflog walk (git log -g)
+  --all, -a      Include all refs (git log --all)
+  -h, --help     Show help
+
+LOG OPTIONS
+  --style=pretty|tree|tree2
+      pretty : one-line colored (default)
+      tree   : --graph view with relative date (good for history)
+      tree2  : --graph view with absolute date + wrapped subject
+
+STATS OPTIONS
+  --me                 Use git config user.name (default)
+  --author <pattern>   Author filter (passed to git log --author=)
+  --since <date>       Passed through to git log
+  --until <date>       Passed through to git log
+
+NOTES
+  - Anything after `--` is passed directly to `git log` (e.g. --max-count, --since).
+  - `--reflog` maps to `git log -g` (walk reflogs).
+EOF
+}
+
+# ---------- common parsing helpers ----------
+
+# Parse global opts that we want for multiple commands. Leaves remaining args in a global array REM.
+REFFLAG=0
+ALLFLAG=0
+REM=()
+
+parse_global() {
+  REFFLAG=0
+  ALLFLAG=0
+  REM=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reflog|-g) REFFLAG=1; shift ;;
+      --all|-a)    ALLFLAG=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
+      --)          shift; REM+=("$@"); return 0 ;;
+      *)           REM+=("$1"); shift ;;
+    esac
+  done
+}
+
+git_log_base() {
+  # Build the base command as an array on stdout (newline separated), caller reads with mapfile.
+  if [[ "$REFFLAG" -eq 1 ]]; then
+    printf "%s\n" git log -g
+  else
+    printf "%s\n" git log
+  fi
+}
+
+# ---------- log command ----------
+
+cmd_log() {
+  local style="pretty"
+  local extra=()
+
+  # First parse global options + keep everything else
+  parse_global "$@"
+  set -- "${REM[@]}"
+
+  # Then parse log-specific options
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --style=*) style="${1#*=}"; shift ;;
+      --style)   style="${2:-}"; shift 2 ;;
+      --)        shift; extra+=("$@"); break ;;
+      *)         extra+=("$1"); shift ;;
+    esac
+  done
+
+  case "$style" in
+    pretty|tree|tree2) ;;
+    *) die "unknown --style '$style' (expected: pretty|tree|tree2)" ;;
+  esac
+
+  local -a cmd=()
+  mapfile -t cmd < <(git_log_base)
+
+  local -a opts=()
+  [[ "$ALLFLAG" -eq 1 ]] && opts+=(--all)
+
+  if [[ "$style" == "pretty" ]]; then
+    local fmt="%C(red)%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset"
+    exec "${cmd[@]}" \
+      "${opts[@]}" \
+      --abbrev-commit \
+      --pretty=format:"$fmt" \
+      "${extra[@]}"
+  fi
+
+  if [[ "$style" == "tree" ]]; then
+    local fmt="%C(bold blue)%h%C(reset) - %C(bold green)(%ar)%C(reset) %C(white)%s%C(reset) %C(dim white)- %an%C(reset)%C(auto)%d%C(reset)"
+    exec "${cmd[@]}" \
+      "${opts[@]}" \
+      --graph --abbrev-commit --decorate \
+      --format=format:"$fmt" \
+      "${extra[@]}"
+  fi
+
+  # tree2
+  local fmt="%C(bold blue)%h%C(reset) - %C(bold cyan)%aD%C(reset) %C(bold green)(%ar)%C(reset)%C(auto)%d%C(reset)%n          %C(white)%s%C(reset) %C(dim white)- %an%C(reset)"
+  exec "${cmd[@]}" \
+    "${opts[@]}" \
+    --graph --abbrev-commit --decorate \
+    --format=format:"$fmt" \
+    "${extra[@]}"
+}
+
+# ---------- stats command (improved, uses --numstat instead of parsing --shortstat) ----------
+
+cmd_stats() {
+  local author=""
+  local since=""
+  local until=""
+  local extra=()
+
+  parse_global "$@"
+  set -- "${REM[@]}"
+
+  # defaults
+  author="$(git config user.name 2>/dev/null || true)"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --me) author="$(git config user.name 2>/dev/null || true)"; shift ;;
+      --author) author="${2:-}"; shift 2 ;;
+      --author=*) author="${1#*=}"; shift ;;
+      --since) since="${2:-}"; shift 2 ;;
+      --since=*) since="${1#*=}"; shift ;;
+      --until) until="${2:-}"; shift 2 ;;
+      --until=*) until="${1#*=}"; shift ;;
+      --) shift; extra+=("$@"); break ;;
+      *)  extra+=("$1"); shift ;;
+    esac
+  done
+
+  [[ -n "$author" ]] || die "author is empty (set git config user.name, or pass --author)"
+
+  local -a cmd=()
+  mapfile -t cmd < <(git_log_base)
+
+  local -a opts=()
+  [[ "$ALLFLAG" -eq 1 ]] && opts+=(--all)
+  [[ -n "$since" ]] && opts+=(--since="$since")
+  [[ -n "$until" ]] && opts+=(--until="$until")
+  opts+=(--author="$author")
+
+  # Use --numstat for reliable parsing (handles 0 insertions/deletions, avoids shortstat grep/awk fragility).
+  # Count:
+  # - commits: number of commits in the selection
+  # - file_lines: number of file entries (roughly "files changed total" across commits; matches the spirit of report1)
+  # - inserted/deleted: sum of numeric numstat columns (binary files show '-' -> treated as 0)
+  #
+  # If you want "unique files touched", that can be added, but this mirrors your current roll-up semantics.
+  "${cmd[@]}" "${opts[@]}" --pretty=tformat:'__CLK_COMMIT__%H' --numstat "${extra[@]}" |
+    awk '
+      BEGIN {
+        commits=0; file_lines=0; ins=0; del=0;
+      }
+      /^__CLK_COMMIT__/ { commits++; next }
+      NF >= 3 {
+        a=$1; d=$2;
+        if (a ~ /^[0-9]+$/) ins += a;
+        if (d ~ /^[0-9]+$/) del += d;
+        file_lines++;
+      }
+      END {
+        delta = ins - del;
+        ratio = (ins > 0) ? (del / ins) : 0;
+        printf "Commit stats (author: %s)\n", ENVIRON["CLK_AUTHOR"];
+        printf "- Commits................  %d\n", commits;
+        printf "- Files changed (total)..  %d\n", file_lines;
+        printf "- Lines added (total)....  %d\n", ins;
+        printf "- Lines deleted (total)..  %d\n", del;
+        printf "- Total lines (delta)....  %d\n", delta;
+        printf "- Add./Del. ratio (1:n)..  1 : %.2f\n", ratio;
+      }
+    ' CLK_AUTHOR="$author"
+}
+
+# ---------- main dispatch ----------
+
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 0; }
+  shift || true
+
+  case "$cmd" in
+    help|-h|--help) usage ;;
+
+    # Better names
+    log)   cmd_log "$@" ;;
+    stats) cmd_stats "$@" ;;
+
+    # Compatibility shims (your old alias names)
+    glog)  cmd_log --style=pretty "$@" ;;
+    glog1) cmd_log --style=tree --all "$@" ;;
+    glog2) cmd_log --style=tree2 "$@" ;;
+    report1) cmd_stats --me "$@" ;;
+
+    *) die "unknown command '$cmd' (try: git clk help)" ;;
+  esac
+}
+
+main "$@"

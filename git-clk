@@ -11,7 +11,7 @@ set -euo pipefail
 NOTE_GRAPH_REFFLAG=0
 prog="${0##*/}"
 
-die()
+function die()
 {
 	echo "error: $*" >&2; exit 2;
 }
@@ -25,8 +25,9 @@ USAGE
   git clk <command> [options] [-- <git-log-options>]
 
 COMMANDS
-  log        Pretty one-line log
-  stats      Cumulative change stats
+  log         Pretty one-line log
+  stats       Cumulative change stats
+  my-branches List of your branches on remote
 
 COMPAT ALIASES
   glog       -> log
@@ -209,7 +210,7 @@ function cmd_stats()
 				file_lines++;
 			}
 			END {
-			delta = ins - del;
+				delta = ins - del;
 				ratio = (ins > 0) ? (del / ins) : 0;
 				printf "Commit stats (author: %s)\n", ENVIRON["CLK_AUTHOR"];
 				printf "- Commits................  %d\n", commits;
@@ -220,6 +221,11 @@ function cmd_stats()
 				printf "- Add./Del. ratio (1:n)..  1 : %.2f\n", ratio;
 			}
 		' CLK_AUTHOR="$author"
+}
+
+function my_branches()
+{
+	git for-each-ref --format='%(authorname)%09%(refname:short)%09%(contents:subject)' refs/remotes/origin | grep "$(git config user.name)" | column -t -s $'\t'
 }
 
 # ---------- main dispatch ----------
@@ -236,6 +242,7 @@ function main()
 		# Better names
 		log)   cmd_log "$@" ;;
 		stats) cmd_stats "$@" ;;
+		my-branches) my_branches "$@" ;;
 
 		# Compatibility shims (your old alias names)
 		glog)  cmd_log --style=pretty "$@" ;;

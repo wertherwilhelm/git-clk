@@ -3,229 +3,525 @@
 #-----------------------------------------------------------------------------------------//
 # git-clk
 #
-# clk sub command for git to add some easy logging to avoid the aliases.
+# clk sub command for git: keep, document and share git aliases in one tracked file
+# (aliases.gitconfig), with reusable alias lists in aliases.d/.
 #-----------------------------------------------------------------------------------------//
 
 set -euo pipefail
-
-NOTE_GRAPH_REFFLAG=0
-prog="${0##*/}"
 
 function die()
 {
 	echo "error: $*" >&2; exit 2;
 }
 
+# ---------- alias management ----------
+#
+# Managed aliases live in a tracked git-config file in this repo ($ALIAS_FILE) that is
+# pulled into ~/.gitconfig with a single include.path line (`git clk alias install`).
+# Each alias can carry a description, stored in a [clkdoc] section of the same file
+# (git ignores sections it does not know about):
+#
+#   [alias]
+#       unstage = restore --staged
+#   [clkdoc]
+#       unstage = Unstage paths, keeping the worktree changes
+#
+# Alias lists in $LIST_DIR/<name>.gitconfig use the same format and are merged into the
+# managed file with `git clk alias import <name>`.
+
+CLK_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ALIAS_FILE="${CLK_ALIAS_FILE:-$CLK_DIR/aliases.gitconfig}"
+LIST_DIR="${CLK_ALIAS_LISTS:-$CLK_DIR/aliases.d}"
+DOC_SECTION="clkdoc"
+GLOBAL_FILE="${GIT_CONFIG_GLOBAL:-$HOME/.gitconfig}"
+
+if [[ -t 1 ]]; then
+	C_RESET=$'\033[0m' C_DIM=$'\033[2m' C_BOLD=$'\033[1m'
+	C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m'
+else
+	C_RESET='' C_DIM='' C_BOLD='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+fi
+
+function warn()
+{
+	echo "${C_YELLOW}warning:${C_RESET} $*" >&2
+}
+
+function tildify()
+{
+	echo "${1/#$HOME/\~}"
+}
+
 function usage()
 {
 	cat <<'EOF'
-git clk — clk git reports
+git clk — manage and document git aliases in one place
 
 USAGE
-  git clk <command> [options] [-- <git-log-options>]
+  git clk alias <command> [options]
 
 COMMANDS
-  log         Pretty one-line log
-  stats       Cumulative change stats
-  my-branches List of your branches on remote
+  list [-v] [--markdown] [pattern]
+                       List managed aliases with their descriptions
+                       (-v also shows expansions; pattern matches names and descriptions)
+  show <name>          Show one alias, its description, and which config file wins
+  add [-f] [-m <desc>] <name> <expansion...>
+                       Add an alias (-f replaces an existing one)
+  rm <name>...         Remove aliases and their descriptions
+  doc <name> [<desc>]  Set (or with no <desc>, clear) an alias description
+  import [-f] [-n] <list|file>...
+                       Merge alias lists into the managed file
+                       (-f replaces aliases that differ, -n shows what would change)
+  import [-f] [-n] --global [--move]
+                       Pull loose aliases out of ~/.gitconfig
+                       (--move also removes them from ~/.gitconfig)
+  export <list> <name>...
+                       Copy managed aliases (and descriptions) into a list
+  lists                Show the available alias lists
+  status               Show the managed file, install state and any conflicts
+  install              Add the include.path line to ~/.gitconfig (idempotent)
+  uninstall            Remove the include.path line from ~/.gitconfig
+  edit                 Open the managed file in $VISUAL / $EDITOR
 
-COMPAT ALIASES
-  glog       -> log
-  glog1      -> log --style=tree --all
-  glog2      -> log --style=tree2
-  report1    -> stats --me
-
-GLOBAL OPTIONS (apply to log/stats)
-  --reflog, -g   Use reflog walk (git log -g)
-  --all, -a      Include all refs (git log --all)
-  -h, --help     Show help
-
-LOG OPTIONS
-  --style=pretty|tree|tree2
-      pretty : one-line colored (default)
-      tree   : --graph view with relative date (good for history)
-      tree2  : --graph view with absolute date + wrapped subject
-
-STATS OPTIONS
-  --me                 Use git config user.name (default)
-  --author <pattern>   Author filter (passed to git log --author=)
-  --since <date>       Passed through to git log
-  --until <date>       Passed through to git log
+FILES
+  aliases.gitconfig    Managed aliases, next to this script (override with CLK_ALIAS_FILE)
+  aliases.d/*.gitconfig
+                       Alias lists (override with CLK_ALIAS_LISTS)
 
 NOTES
-  - Anything after `--` is passed directly to `git log` (e.g. --max-count, --since).
-  - `--reflog` maps to `git log -g` (walk reflogs).
+  - Options can go anywhere; everything after `--` is taken as the expansion.
+  - Quote shell aliases:  git clk alias add who '!git config user.name'
+  - Shell aliases run under /bin/sh, so stick to POSIX syntax.
+  - `git clk --help` makes git look for the man page; `git clk help` prints this.
 EOF
 }
 
-# ---------- common parsing helpers ----------
-
-# Parse global opts that we want for multiple commands. Leaves remaining args in a global array REM.
-REFFLAG=0
-ALLFLAG=0
-REM=()
-
-function parse_global()
+function valid_alias_name()
 {
-	REFFLAG=0
-	ALLFLAG=0
-	REM=()
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--reflog|-g) REFFLAG=1; shift ;;
-			--all|-a)    ALLFLAG=1; shift ;;
-			-h|--help)   usage; exit 0 ;;
-			--)          shift; REM+=("$@"); return 0 ;;
-			*)           REM+=("$1"); shift ;;
-		esac
-	done
+	[[ "$1" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]
 }
 
-function git_log_base()
+function require_name()
 {
-	# Build the base command as an array on stdout (newline separated), caller reads with mapfile.
-	if [[ "$REFFLAG" -eq 1 ]]; then
-		printf "%s\n" git log -g
+	[[ -n "${1:-}" ]] || die "missing alias name"
+	valid_alias_name "$1" || die "invalid alias name '$1' (letters, digits and '-', starting with a letter)"
+}
+
+function acfg()
+{
+	git config -f "$ALIAS_FILE" "$@"
+}
+
+function ensure_config_file() # <file> <header line>
+{
+	[[ -f "$1" ]] && return 0
+	mkdir -p "$(dirname "$1")"
+	cat > "$1" <<EOF
+# $2
+#
+# Format: [alias] holds the definitions, [$DOC_SECTION] holds a one-line description
+# for each alias.  Edit with \`git clk alias\` or by hand.
+
+EOF
+}
+
+function ensure_alias_file()
+{
+	ensure_config_file "$ALIAS_FILE" "Managed by git clk alias; included from ~/.gitconfig"
+}
+
+# Load "<section>.<name> = value" entries of a config file into an associative array.
+function load_section() # <file> <section> <array name>
+{
+	local file="$1" section="$2" entry key value
+	local -n out="$3"
+	[[ -f "$file" ]] || return 0
+	while IFS= read -r -d '' entry; do
+		key="${entry%%$'\n'*}"
+		if [[ "$entry" == *$'\n'* ]]; then value="${entry#*$'\n'}"; else value=""; fi
+		out["${key#"$section".}"]="$value"
+	done < <(git config -f "$file" -z --get-regexp "^${section}\\." || true)
+}
+
+function sorted_keys() # <array name>
+{
+	local -n arr="$1"
+	[[ ${#arr[@]} -gt 0 ]] || return 0
+	printf '%s\n' "${!arr[@]}" | sort
+}
+
+function is_builtin()
+{
+	git --list-cmds=builtins 2>/dev/null | grep -qxF "$1"
+}
+
+# Write one alias (and optional description) into a config file.
+function put_alias() # <file> <name> <expansion> [<desc>]
+{
+	git config -f "$1" --replace-all "alias.$2" "$3"
+	if [[ -n "${4:-}" ]]; then
+		git config -f "$1" --replace-all "$DOC_SECTION.$2" "$4"
+	fi
+}
+
+function drop_alias() # <file> <name>
+{
+	git config -f "$1" --unset-all "alias.$2" || true
+	git config -f "$1" --unset-all "$DOC_SECTION.$2" || true
+}
+
+function resolve_list() # <list name or path>
+{
+	if [[ -f "$1" ]]; then
+		echo "$1"
+	elif [[ -f "$LIST_DIR/$1.gitconfig" ]]; then
+		echo "$LIST_DIR/$1.gitconfig"
+	elif [[ -f "$LIST_DIR/$1" ]]; then
+		echo "$LIST_DIR/$1"
 	else
-		printf "%s\n" git log
+		die "no alias list '$1' (see: git clk alias lists)"
 	fi
 }
 
-# ---------- log command ----------
-
-function cmd_log()
+function alias_list()
 {
-	local style="pretty"
-	local extra=()
-
-	# First parse global options + keep everything else
-	parse_global "$@"
-	set -- "${REM[@]}"
-
-	# Then parse log-specific options
+	local verbose=0 markdown=0 pattern=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--style=*) style="${1#*=}"; shift ;;
-			--style)   style="${2:-}"; shift 2 ;;
-			--)        shift; extra+=("$@"); break ;;
-			*)         extra+=("$1"); shift ;;
+			-v|--verbose) verbose=1; shift ;;
+			--markdown|--md) markdown=1; shift ;;
+			-*) die "unknown option '$1' for list" ;;
+			*) pattern="$1"; shift ;;
 		esac
 	done
 
-	case "$style" in
-		pretty|tree|tree2) ;;
-		*) die "unknown --style '$style' (expected: pretty|tree|tree2)" ;;
+	local -A aliases=() docs=()
+	load_section "$ALIAS_FILE" alias aliases
+	load_section "$ALIAS_FILE" "$DOC_SECTION" docs
+
+	local -a names=()
+	mapfile -t names < <(sorted_keys aliases)
+	if [[ -n "$pattern" ]]; then
+		local -a keep=()
+		local n
+		for n in "${names[@]}"; do
+			[[ "$n" == *"$pattern"* || "${docs[$n]:-}" == *"$pattern"* ]] && keep+=("$n")
+		done
+		names=("${keep[@]}")
+	fi
+
+	if [[ ${#names[@]} -eq 0 ]]; then
+		echo "no managed aliases${pattern:+ matching '$pattern'} in $(tildify "$ALIAS_FILE")" >&2
+		return 0
+	fi
+
+	local n width=0
+	for n in "${names[@]}"; do (( ${#n} > width )) && width=${#n}; done
+
+	if [[ "$markdown" -eq 1 ]]; then
+		local exp desc
+		echo "| Alias | Expands to | Description |"
+		echo "|-------|------------|-------------|"
+		for n in "${names[@]}"; do
+			exp="${aliases[$n]//|/\\|}"
+			desc="${docs[$n]:-}"
+			printf '| `git %s` | `%s` | %s |\n' "$n" "$exp" "${desc//|/\\|}"
+		done
+		return 0
+	fi
+
+	for n in "${names[@]}"; do
+		printf '%s%-*s%s  %s\n' "$C_BOLD" "$width" "$n" "$C_RESET" "${docs[$n]:-${C_DIM}(no description)${C_RESET}}"
+		if [[ "$verbose" -eq 1 ]]; then
+			printf '%*s  %s%s%s\n' "$width" "" "$C_CYAN" "${aliases[$n]}" "$C_RESET"
+		fi
+	done
+}
+
+function alias_show()
+{
+	local name="${1:-}"
+	require_name "$name"
+	local exp
+	exp="$(acfg --get "alias.$name" 2>/dev/null)" || die "'$name' is not a managed alias"
+
+	printf '%sgit %s%s\n' "$C_BOLD" "$name" "$C_RESET"
+	printf '  expands to:  %s\n' "$exp"
+	printf '  description: %s\n' "$(acfg --get "$DOC_SECTION.$name" 2>/dev/null || echo '(none)')"
+
+	# Which definition git actually uses (last one wins across included files).
+	local origin
+	origin="$(git config --show-origin --get "alias.$name" 2>/dev/null | cut -f1)" || true
+	if [[ -z "$origin" ]]; then
+		printf '  in effect:   %sno (run: git clk alias install)%s\n' "$C_YELLOW" "$C_RESET"
+	elif [[ "$origin" == "file:$ALIAS_FILE" ]]; then
+		printf '  in effect:   yes\n'
+	else
+		printf '  in effect:   %sshadowed by %s%s\n' "$C_YELLOW" "$(tildify "${origin#file:}")" "$C_RESET"
+	fi
+	is_builtin "$name" && warn "'$name' is a built-in git command; git will ignore this alias"
+	return 0
+}
+
+function alias_add()
+{
+	local force=0 desc=""
+	local -a rest=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-f|--force) force=1; shift ;;
+			-m|--doc) [[ $# -ge 2 ]] || die "$1 needs a description"; desc="$2"; shift 2 ;;
+			--doc=*) desc="${1#*=}"; shift ;;
+			--) shift; rest+=("$@"); break ;;
+			*) rest+=("$1"); shift ;;
+		esac
+	done
+
+	local name="${rest[0]:-}"
+	require_name "$name"
+	[[ ${#rest[@]} -ge 2 ]] || die "missing expansion for '$name'"
+	local exp="${rest[*]:1}"
+
+	ensure_alias_file
+	local old
+	if old="$(acfg --get "alias.$name" 2>/dev/null)"; then
+		if [[ "$old" != "$exp" && "$force" -eq 0 ]]; then
+			die "'$name' already exists: $old (use -f to replace)"
+		fi
+	fi
+
+	if is_builtin "$name"; then
+		[[ "$force" -eq 1 ]] || die "'$name' is a built-in git command; git would ignore this alias (use -f to add it anyway)"
+		warn "'$name' is a built-in git command; git will ignore this alias"
+	fi
+	if git config -f "$GLOBAL_FILE" --get "alias.$name" >/dev/null 2>&1; then
+		warn "'$name' is also defined in $(tildify "$GLOBAL_FILE") (git clk alias import --global --move cleans that up)"
+	fi
+
+	put_alias "$ALIAS_FILE" "$name" "$exp" "$desc"
+	echo "${C_GREEN}+${C_RESET} $name = $exp"
+}
+
+function alias_rm()
+{
+	[[ $# -gt 0 ]] || die "usage: git clk alias rm <name>..."
+	local name status=0
+	for name in "$@"; do
+		if acfg --get "alias.$name" >/dev/null 2>&1; then
+			drop_alias "$ALIAS_FILE" "$name"
+			echo "${C_RED}-${C_RESET} $name"
+		else
+			warn "'$name' is not a managed alias"
+			status=1
+		fi
+	done
+	return "$status"
+}
+
+function alias_doc()
+{
+	local name="${1:-}"
+	require_name "$name"
+	shift
+	acfg --get "alias.$name" >/dev/null 2>&1 || die "'$name' is not a managed alias"
+	if [[ $# -eq 0 ]]; then
+		acfg --unset-all "$DOC_SECTION.$name" || true
+		echo "cleared description for $name"
+	else
+		acfg --replace-all "$DOC_SECTION.$name" "$*"
+		echo "$name: $*"
+	fi
+}
+
+# Merge the aliases of one config file into the managed file.
+# Prints one line per alias; sets IMPORTED to the names that were added or already matched.
+IMPORTED=()
+function merge_from() # <file> <force> <dry run>
+{
+	local file="$1" force="$2" dry="$3" n mark
+	local -A src=() src_docs=() cur=() cur_docs=()
+	load_section "$file" alias src
+	load_section "$file" "$DOC_SECTION" src_docs
+	load_section "$ALIAS_FILE" alias cur
+	load_section "$ALIAS_FILE" "$DOC_SECTION" cur_docs
+
+	IMPORTED=()
+	local added=0 same=0 replaced=0 skipped=0
+	local -a names=()
+	mapfile -t names < <(sorted_keys src)
+	for n in "${names[@]}"; do
+		if [[ -z "${cur[$n]+x}" ]]; then
+			mark="${C_GREEN}+${C_RESET}"; added=$((added + 1))
+		elif [[ "${cur[$n]}" == "${src[$n]}" ]]; then
+			mark="="; same=$((same + 1))
+			# Pick up a description the managed copy is missing.
+			if [[ -z "${cur_docs[$n]:-}" && -n "${src_docs[$n]:-}" && "$dry" -eq 0 ]]; then
+				acfg --replace-all "$DOC_SECTION.$n" "${src_docs[$n]}"
+			fi
+			IMPORTED+=("$n")
+			echo "$mark $n"
+			continue
+		elif [[ "$force" -eq 1 ]]; then
+			mark="${C_YELLOW}~${C_RESET}"; replaced=$((replaced + 1))
+		else
+			skipped=$((skipped + 1))
+			echo "${C_RED}!${C_RESET} $n differs (managed: ${cur[$n]}) — use -f to replace"
+			continue
+		fi
+
+		[[ "$dry" -eq 1 ]] || put_alias "$ALIAS_FILE" "$n" "${src[$n]}" "${src_docs[$n]:-${cur_docs[$n]:-}}"
+		IMPORTED+=("$n")
+		echo "$mark $n = ${src[$n]}"
+	done
+
+	local note=""
+	[[ "$dry" -eq 1 ]] && note=" (dry run)"
+	echo "${C_DIM}$(tildify "$file"): $added added, $replaced replaced, $same unchanged, $skipped skipped$note${C_RESET}"
+}
+
+function alias_import()
+{
+	local force=0 dry=0 global=0 move=0
+	local -a lists=()
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-f|--force) force=1; shift ;;
+			-n|--dry-run) dry=1; shift ;;
+			--global) global=1; shift ;;
+			--move) move=1; shift ;;
+			-*) die "unknown option '$1' for import" ;;
+			*) lists+=("$1"); shift ;;
+		esac
+	done
+
+	[[ "$move" -eq 0 || "$global" -eq 1 ]] || die "--move only applies to --global"
+	[[ "$global" -eq 1 || ${#lists[@]} -gt 0 ]] || die "usage: git clk alias import [-f] [-n] <list>... | --global [--move]"
+
+	[[ "$dry" -eq 1 ]] || ensure_alias_file
+
+	local l
+	for l in "${lists[@]}"; do
+		merge_from "$(resolve_list "$l")" "$force" "$dry"
+	done
+
+	if [[ "$global" -eq 1 ]]; then
+		[[ -f "$GLOBAL_FILE" ]] || die "no global config at $(tildify "$GLOBAL_FILE")"
+		merge_from "$GLOBAL_FILE" "$force" "$dry"
+		if [[ "$move" -eq 1 && "$dry" -eq 0 && ${#IMPORTED[@]} -gt 0 ]]; then
+			local n
+			for n in "${IMPORTED[@]}"; do
+				git config -f "$GLOBAL_FILE" --unset-all "alias.$n" || true
+			done
+			echo "removed ${#IMPORTED[@]} alias(es) from $(tildify "$GLOBAL_FILE")"
+		fi
+	fi
+}
+
+function alias_export()
+{
+	local list="${1:-}"
+	[[ -n "$list" && $# -ge 2 ]] || die "usage: git clk alias export <list> <name>..."
+	shift
+
+	local file
+	if [[ "$list" == */* ]]; then file="$list"; else file="$LIST_DIR/${list%.gitconfig}.gitconfig"; fi
+	ensure_config_file "$file" "Alias list '$(basename "${file%.gitconfig}")' — import with: git clk alias import $(basename "${file%.gitconfig}")"
+
+	local name exp
+	for name in "$@"; do
+		exp="$(acfg --get "alias.$name" 2>/dev/null)" || die "'$name' is not a managed alias"
+		put_alias "$file" "$name" "$exp" "$(acfg --get "$DOC_SECTION.$name" 2>/dev/null || true)"
+		echo "${C_GREEN}+${C_RESET} $name -> $(tildify "$file")"
+	done
+}
+
+function alias_lists()
+{
+	local f name count about
+	shopt -s nullglob
+	local -a files=("$LIST_DIR"/*.gitconfig)
+	shopt -u nullglob
+	[[ ${#files[@]} -gt 0 ]] || { echo "no alias lists in $(tildify "$LIST_DIR")" >&2; return 0; }
+
+	for f in "${files[@]}"; do
+		name="$(basename "${f%.gitconfig}")"
+		count="$(git config -f "$f" --get-regexp '^alias\.' 2>/dev/null | wc -l)"
+		about="$(sed -n 's/^# \{0,1\}//p' "$f" | head -1)"
+		printf '%s%-12s%s %3d  %s\n' "$C_BOLD" "$name" "$C_RESET" "$count" "$about"
+	done
+}
+
+function is_installed()
+{
+	git config -f "$GLOBAL_FILE" --get-all include.path 2>/dev/null | grep -qxF "$ALIAS_FILE"
+}
+
+function alias_status()
+{
+	local -A aliases=() global=()
+	load_section "$ALIAS_FILE" alias aliases
+	load_section "$GLOBAL_FILE" alias global
+
+	echo "managed file: $(tildify "$ALIAS_FILE") (${#aliases[@]} aliases)"
+	if is_installed; then
+		echo "installed:    yes, included from $(tildify "$GLOBAL_FILE")"
+	else
+		echo "installed:    ${C_YELLOW}no${C_RESET} (run: git clk alias install)"
+	fi
+	echo "global loose: ${#global[@]} alias(es) in $(tildify "$GLOBAL_FILE")"
+
+	local n
+	while IFS= read -r n; do
+		[[ -n "$n" ]] || continue
+		if [[ -n "${global[$n]+x}" && "${global[$n]}" != "${aliases[$n]}" ]]; then
+			warn "'$n' is defined differently in $(tildify "$GLOBAL_FILE")"
+		fi
+		is_builtin "$n" && warn "'$n' is a built-in git command; git ignores it"
+	done < <(sorted_keys aliases)
+	return 0
+}
+
+function alias_install()
+{
+	ensure_alias_file
+	if is_installed; then
+		echo "already installed: $(tildify "$GLOBAL_FILE") includes $(tildify "$ALIAS_FILE")"
+		return 0
+	fi
+	git config -f "$GLOBAL_FILE" --add include.path "$ALIAS_FILE"
+	echo "added include.path = $ALIAS_FILE to $(tildify "$GLOBAL_FILE")"
+}
+
+function alias_uninstall()
+{
+	if ! is_installed; then
+		echo "not installed"
+		return 0
+	fi
+	git config -f "$GLOBAL_FILE" --fixed-value --unset-all include.path "$ALIAS_FILE"
+	echo "removed include.path = $ALIAS_FILE from $(tildify "$GLOBAL_FILE")"
+}
+
+function cmd_alias()
+{
+	local sub="${1:-list}"
+	shift || true
+	case "$sub" in
+		help|-h|--help) usage ;;
+		list|ls)        alias_list "$@" ;;
+		show)           alias_show "$@" ;;
+		add)            alias_add "$@" ;;
+		rm|remove)      alias_rm "$@" ;;
+		doc)            alias_doc "$@" ;;
+		import)         alias_import "$@" ;;
+		export)         alias_export "$@" ;;
+		lists)          alias_lists "$@" ;;
+		status)         alias_status "$@" ;;
+		install)        alias_install "$@" ;;
+		uninstall)      alias_uninstall "$@" ;;
+		edit)           ensure_alias_file; exec "${VISUAL:-${EDITOR:-vi}}" "$ALIAS_FILE" ;;
+		*) die "unknown alias command '$sub' (try: git clk alias help)" ;;
 	esac
-
-	local -a cmd=()
-	mapfile -t cmd < <(git_log_base)
-
-	local -a opts=()
-	[[ "$ALLFLAG" -eq 1 ]] && opts+=(--all)
-
-	if [[ "$style" == "pretty" ]]; then
-		local fmt="%C(red)%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset"
-		exec "${cmd[@]}" \
-			"${opts[@]}" \
-			--abbrev-commit \
-			--pretty=format:"$fmt" \
-			"${extra[@]}"
-	fi
-
-	if [[ "$style" == "tree" ]]; then
-		local fmt="%C(bold blue)%h%C(reset) - %C(bold green)(%ar)%C(reset) %C(white)%s%C(reset) %C(dim white)- %an%C(reset)%C(auto)%d%C(reset)"
-		exec "${cmd[@]}" \
-			"${opts[@]}" \
-			--graph --abbrev-commit --decorate \
-			--format=format:"$fmt" \
-			"${extra[@]}"
-	fi
-
-	# tree2
-	local fmt="%C(bold blue)%h%C(reset) - %C(bold cyan)%aD%C(reset) %C(bold green)(%ar)%C(reset)%C(auto)%d%C(reset)%n          %C(white)%s%C(reset) %C(dim white)- %an%C(reset)"
-	exec "${cmd[@]}" \
-		"${opts[@]}" \
-		--graph --abbrev-commit --decorate \
-		--format=format:"$fmt" \
-		"${extra[@]}"
-}
-
-# ---------- stats command (improved, uses --numstat instead of parsing --shortstat) ----------
-
-function cmd_stats()
-{
-	local author=""
-	local since=""
-	local until=""
-	local extra=()
-
-	parse_global "$@"
-	set -- "${REM[@]}"
-
-	# defaults
-	author="$(git config user.name 2>/dev/null || true)"
-
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--me) author="$(git config user.name 2>/dev/null || true)"; shift ;;
-			--author) author="${2:-}"; shift 2 ;;
-			--author=*) author="${1#*=}"; shift ;;
-			--since) since="${2:-}"; shift 2 ;;
-			--since=*) since="${1#*=}"; shift ;;
-			--until) until="${2:-}"; shift 2 ;;
-			--until=*) until="${1#*=}"; shift ;;
-			--) shift; extra+=("$@"); break ;;
-			*)  extra+=("$1"); shift ;;
-		esac
-	done
-
-	[[ -n "$author" ]] || die "author is empty (set git config user.name, or pass --author)"
-
-	local -a cmd=()
-	mapfile -t cmd < <(git_log_base)
-
-	local -a opts=()
-	[[ "$ALLFLAG" -eq 1 ]] && opts+=(--all)
-	[[ -n "$since" ]] && opts+=(--since="$since")
-	[[ -n "$until" ]] && opts+=(--until="$until")
-	opts+=(--author="$author")
-
-	# Use --numstat for reliable parsing (handles 0 insertions/deletions, avoids shortstat grep/awk fragility).
-	# Count:
-	# - commits: number of commits in the selection
-	# - file_lines: number of file entries (roughly "files changed total" across commits; matches the spirit of report1)
-	# - inserted/deleted: sum of numeric numstat columns (binary files show '-' -> treated as 0)
-	#
-	# If you want "unique files touched", that can be added, but this mirrors your current roll-up semantics.
-	"${cmd[@]}" "${opts[@]}" --pretty=tformat:'__CLK_COMMIT__%H' --numstat "${extra[@]}" |
-		awk '
-			BEGIN {
-				commits=0; file_lines=0; ins=0; del=0;
-			}
-			/^__CLK_COMMIT__/ { commits++; next }
-			NF >= 3 {
-				a=$1; d=$2;
-				if (a ~ /^[0-9]+$/) ins += a;
-				if (d ~ /^[0-9]+$/) del += d;
-				file_lines++;
-			}
-			END {
-				delta = ins - del;
-				ratio = (ins > 0) ? (del / ins) : 0;
-				printf "Commit stats (author: %s)\n", ENVIRON["CLK_AUTHOR"];
-				printf "- Commits................  %d\n", commits;
-				printf "- Files changed (total)..  %d\n", file_lines;
-				printf "- Lines added (total)....  %d\n", ins;
-				printf "- Lines deleted (total)..  %d\n", del;
-				printf "- Total lines (delta)....  %d\n", delta;
-				printf "- Add./Del. ratio (1:n)..  1 : %.2f\n", ratio;
-			}
-		' CLK_AUTHOR="$author"
-}
-
-function my_branches()
-{
-	git for-each-ref --format='%(authorname)%09%(refname:short)%09%(contents:subject)' refs/remotes/origin | grep "$(git config user.name)" | column -t -s $'\t'
 }
 
 # ---------- main dispatch ----------
@@ -238,18 +534,7 @@ function main()
 
 	case "$cmd" in
 		help|-h|--help) usage ;;
-
-		# Better names
-		log)   cmd_log "$@" ;;
-		stats) cmd_stats "$@" ;;
-		my-branches) my_branches "$@" ;;
-
-		# Compatibility shims (your old alias names)
-		glog)  cmd_log --style=pretty "$@" ;;
-		glog1) cmd_log --style=tree --all "$@" ;;
-		glog2) cmd_log --style=tree2 "$@" ;;
-		report1) cmd_stats --me "$@" ;;
-
+		alias|aliases)  cmd_alias "$@" ;;
 		*) die "unknown command '$cmd' (try: git clk help)" ;;
 	esac
 }

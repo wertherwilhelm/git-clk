@@ -1,0 +1,6 @@
+# Shortcuts for the git-more annotation subcommand — import with: git clk alias import more
+
+[alias]
+	mores = more list --short
+[clkdoc]
+	mores = Short list of git-more annotations

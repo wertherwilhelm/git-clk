@@ -1,191 +1,174 @@
-.TH GIT-CLK 1 "2026-09-22" "git-clk" "Git Manual"
+.TH GIT-CLK 1 "2026-11-10" "git-clk" "Git Manual"
 .SH NAME
-git-clk \- Enhanced git log and statistics reporting
+git-clk \- manage and document git aliases in one place
 .SH SYNOPSIS
-.B git clk
+.B git clk alias
 .I command
 .RI [ options ]
-.RI [ --
-.IR git-log-options ]
 .SH DESCRIPTION
 .B git-clk
-provides enhanced git logging and statistics reporting with multiple output styles and convenient filtering options. It simplifies common git log operations with pre-configured formats and cumulative change statistics.
+keeps your git aliases, and a description for each one, in a single tracked file,
+.IR aliases.gitconfig ,
+next to the
+.B git-clk
+script.
+That file is a normal git config file, pulled into
+.I ~/.gitconfig
+by a single
+.B include.path
+line, so the aliases are version controlled and travel with the repository.
+.PP
+Descriptions live in a
+.B [clkdoc]
+section of the same file, which git ignores:
+.PP
+.RS
+.nf
+[alias]
+	unstage = restore --staged
+[clkdoc]
+	unstage = Unstage paths, keeping the worktree changes
+.fi
+.RE
+.PP
+Alias lists are files in
+.I aliases.d/<name>.gitconfig
+in the same format; importing a list merges it into the managed file.
 .SH COMMANDS
 .TP
-.B log
-Display a pretty one-line formatted git log with color and optional graph views. Supports multiple output styles.
+.BR "alias list " [ -v "] [" --markdown "] [" \fIpattern\fP ]
+List managed aliases with their descriptions.
+.B -v
+also shows each expansion;
+.B --markdown
+prints a table suitable for READMEs or notes.
+.I pattern
+matches alias names and descriptions.
 .TP
-.B stats
-Show cumulative change statistics including commits, files changed, lines added/deleted, and add/delete ratio. Defaults to filtering by the current user.
+.BI "alias show " name
+Show an alias, its description, and whether git actually uses it or it is shadowed by another config file.
 .TP
-.B my-branches
-List all branches on the remote that belong to you (filtered by
-.BR git\ config\ user.name ).
-.SH COMPATIBILITY ALIASES
-The following commands are provided for backward compatibility with existing aliases:
+.BR "alias add " [ -f "] [" -m
+.IR desc ]
+.I name expansion...
+Add an alias.
+.B -f
+replaces an existing alias, or allows a name that is a built-in git command (which git would ignore).
 .TP
-.B glog
-Equivalent to
-.BR "log --style=pretty" .
+.BI "alias rm " name...
+Remove aliases and their descriptions.
 .TP
-.B glog1
-Equivalent to
-.BR "log --style=tree --all" .
+.BI "alias doc " name " \fR[\fP" desc \fR]\fP
+Set a description, or clear it when
+.I desc
+is omitted.
 .TP
-.B glog2
-Equivalent to
-.BR "log --style=tree2" .
+.BR "alias import " [ -f "] [" -n ]
+.I list...
+Merge alias lists (a list name or a file path) into the managed file.
+Aliases that already exist with a different expansion are skipped unless
+.B -f
+is given;
+.B -n
+shows what would change without writing.
 .TP
-.B report1
-Equivalent to
-.BR "stats --me" .
-.SH GLOBAL OPTIONS
-These options apply to both
-.B log
-and
-.B stats
-commands:
+.BR "alias import " [ -f "] [" -n "] " --global " [" --move ]
+Pull loose aliases out of
+.IR ~/.gitconfig ;
+.B --move
+removes the imported ones from
+.I ~/.gitconfig
+afterwards.
 .TP
-.BR -g ", " --reflog
-Use reflog walk (equivalent to
-.BR "git log -g" ).
+.BI "alias export " "list name..."
+Copy managed aliases and their descriptions into
+.IR aliases.d/<list>.gitconfig .
 .TP
-.BR -a ", " --all
-Include all refs (equivalent to
-.BR "git log --all" ).
+.B alias lists
+Show the available alias lists.
 .TP
-.BR -h ", " --help
-Show help message.
-.SH LOG OPTIONS
+.B alias status
+Show the managed file, whether it is installed, and any conflicts.
 .TP
-.BI --style= STYLE
-Select output style. Valid styles:
-.RS
-.IP \fBpretty\fP
-One-line colored format with hash, refs, subject, relative date, and author (default).
-.IP \fBtree\fP
-Graph view with relative dates, good for viewing branch history.
-.IP \fBtree2\fP
-Graph view with absolute dates and wrapped subjects for detailed history.
-.RE
-.SH STATS OPTIONS
+.BR "alias install" ", " "alias uninstall"
+Add or remove the
+.B include.path
+line in
+.IR ~/.gitconfig .
+Both are idempotent.
 .TP
-.B --me
-Use the author name from
-.B git config user.name
-(this is the default).
+.B alias edit
+Open the managed file in
+.BR $VISUAL " or " $EDITOR .
 .TP
-.BI --author \ PATTERN
-Filter by author pattern (passed to
-.BR "git log --author=" ).
-.TP
-.BI --since \ DATE
-Show commits since the specified date (passed through to
-.BR git\ log ).
-.TP
-.BI --until \ DATE
-Show commits until the specified date (passed through to
-.BR git\ log ).
+.B help
+Print the command summary.
 .SH EXAMPLES
-Show a pretty one-line log:
+Set up managed aliases from the bundled lists and install them:
 .RS
 .nf
-$ git clk log
+$ git clk alias lists
+$ git clk alias import log basics
+$ git clk alias import --global --move
+$ git clk alias install
 .fi
 .RE
-
-Show a graph view of all branches:
+.PP
+Add a documented alias, including a shell alias:
 .RS
 .nf
-$ git clk log --style=tree --all
+$ git clk alias add last 'log -1 --stat' -m "Show the last commit"
+$ git clk alias add who '!git config user.name' -m "Who am I"
 .fi
 .RE
-
-Show statistics for your commits in the last week:
+.PP
+Share a few aliases as a new list:
 .RS
 .nf
-$ git clk stats --since="1 week ago"
+$ git clk alias export mine last who
 .fi
 .RE
-
-Show statistics for a specific author:
-.RS
-.nf
-$ git clk stats --author="John Doe"
-.fi
-.RE
-
-Pass additional git log options after
-.BR -- :
-.RS
-.nf
-$ git clk log --style=tree -- --max-count=20
-$ git clk stats -- --since="2026-01-01"
-.fi
-.RE
-
-Show your branches on the remote:
-.RS
-.nf
-$ git clk my-branches
-.fi
-.RE
-
-Use reflog to see recent branch switches:
-.RS
-.nf
-$ git clk log --reflog --style=pretty
-.fi
-.RE
-.SH STATISTICS OUTPUT
-The
-.B stats
-command provides the following metrics:
-.IP \(bu 2
-.B Commits
-\- Number of commits by the author
-.IP \(bu 2
-.B "Files changed (total)"
-\- Total file entries across all commits
-.IP \(bu 2
-.B "Lines added (total)"
-\- Total lines inserted
-.IP \(bu 2
-.B "Lines deleted (total)"
-\- Total lines deleted
-.IP \(bu 2
-.B "Total lines (delta)"
-\- Net change (added minus deleted)
-.IP \(bu 2
-.B "Add./Del. ratio"
-\- Ratio of deletions to additions (1:n format)
+.SH FILES
+.TP
+.I aliases.gitconfig
+Managed aliases, next to the
+.B git-clk
+script (resolved through symlinks).
+.TP
+.I aliases.d/*.gitconfig
+Alias lists.
+.SH ENVIRONMENT
+.TP
+.B CLK_ALIAS_FILE
+Use a different managed alias file.
+.TP
+.B CLK_ALIAS_LISTS
+Use a different alias list directory.
+.TP
+.B GIT_CONFIG_GLOBAL
+Honoured as the location of the global config (default
+.IR ~/.gitconfig ).
 .SH NOTES
 .IP \(bu 2
-All options after
+Options can go anywhere; everything after
 .B --
-are passed directly to
-.BR git\ log .
+is taken as the expansion.
 .IP \(bu 2
-The
-.B --reflog
-flag is useful for seeing your recent navigation history, not just commits.
+Shell aliases (starting with
+.BR ! )
+run under
+.BR /bin/sh ,
+so use POSIX syntax.
 .IP \(bu 2
-Colors in
-.B log
-output may not display properly on all terminals.
-.IP \(bu 2
-The
-.B stats
-command uses
-.B git log --numstat
-for reliable parsing of changes.
+.B git clk --help
+makes git look for this man page;
+.B git clk help
+prints the summary.
 .SH EXIT STATUS
 .B git-clk
-exits with status 0 on success, and non-zero on error (e.g., invalid command, missing author for stats).
+exits with status 0 on success, and non-zero on error.
 .SH SEE ALSO
 .BR git (1),
-.BR git-log (1),
-.BR git-reflog (1),
-.BR git-for-each-ref (1)
+.BR git-config (1)
 .SH AUTHOR
 Written by cking.

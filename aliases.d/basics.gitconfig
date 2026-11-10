@@ -1,0 +1,8 @@
+# Everyday shortcuts — import with: git clk alias import basics
+
+[alias]
+	unstage = restore --staged
+	grab = "!f(){ br=\"$1\"; shift; git restore --worktree --source \"$br\" -- \"$@\"; }; f"
+[clkdoc]
+	unstage = Unstage paths, keeping the worktree changes
+	grab = "Copy file(s) from another branch into the worktree, unstaged: git grab <branch> <path>..."

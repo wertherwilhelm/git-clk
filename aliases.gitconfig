@@ -1,0 +1,17 @@
+# Managed by git clk alias; included from ~/.gitconfig
+#
+# Format: [alias] holds the definitions, [clkdoc] holds a one-line description
+# for each alias.  Edit with `git clk alias` or by hand.
+
+[alias]
+	glog = log --abbrev-commit --pretty=format:'%C(red)%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset'
+	glog1 = log --all --graph --abbrev-commit --decorate --format=format:'%C(bold blue)%h%C(reset) - %C(bold green)(%ar)%C(reset) %C(white)%s%C(reset) %C(dim white)- %an%C(reset)%C(auto)%d%C(reset)'
+	glog2 = log --graph --abbrev-commit --decorate --format=format:'%C(bold blue)%h%C(reset) - %C(bold cyan)%aD%C(reset) %C(bold green)(%ar)%C(reset)%C(auto)%d%C(reset)%n          %C(white)%s%C(reset) %C(dim white)- %an%C(reset)'
+	my-branches = !git for-each-ref --format=\"%(authorname)%09%(refname:short)%09%(contents:subject)\" refs/remotes/origin | grep -F \"$(git config user.name)\" | column -t -s \"$(printf \"\\t\")\"
+	report1 = "!f(){ a=\"$(git config user.name)\"; for x in \"$@\"; do case \"$x\" in --author=*) a=\"${x#--author=}\";; esac; done; git log --author=\"$a\" --pretty=tformat:__CLK_COMMIT__%H --numstat \"$@\" | awk -v author=\"$a\" '/^__CLK_COMMIT__/ {c++; next} NF >= 3 {if ($1 ~ /^[0-9]+$/) i += $1; if ($2 ~ /^[0-9]+$/) d += $2; f++} END {printf \"Commit stats (author: %s)\\n- Commits................  %d\\n- Files changed (total)..  %d\\n- Lines added (total)....  %d\\n- Lines deleted (total)..  %d\\n- Total lines (delta)....  %d\\n- Add./Del. ratio (1:n)..  1 : %.2f\\n\", author, c, f, i, d, i - d, (i > 0 ? d / i : 0)}'; }; f"
+[clkdoc]
+	glog = Pretty one-line log
+	glog1 = Graph of all refs with relative dates
+	glog2 = Graph with absolute dates and wrapped subjects
+	my-branches = Your branches on origin
+	report1 = Your cumulative change stats (git log args pass through, e.g. --since, --author=)
